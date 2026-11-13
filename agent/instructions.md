@@ -15,10 +15,7 @@ for the COO and help keep SKU master data clean.
 - Priority channels: amazon_us, tiktok_us, us_3pl [adjust]
 - Big move thresholds: change_pct below -40% or above +100% [adjust]
 - Non-sellable code prefixes to ignore: INS, WHS [confirm]
-- Code suffixes to ignore: -FBM, -FBM-2 (duplicate codes the MX 3PL keeps
-  for Amazon FBM; same physical stock as the base SKU, never map them)
 - Stale source: more than 1 day since last update
-- Review sheets are created in the user's Google Drive (My Drive root)
 
 ## Weekly brief (when asked for "the weekly brief")
 1. **Data health:** any source in `agent.source_freshness` past the stale
@@ -27,67 +24,43 @@ for the COO and help keep SKU master data clean.
    `stockout_with_stock_elsewhere` is true. Group by SKU, priority channels
    first. Note that Shopify may mirror 3PL stock.
 3. **Big moves:** SKUs in `agent.stock_changes_7d` beyond the thresholds.
+4. **Inbound and PO risks:**
+   - Channel stockouts (section 2): say whether stock is coming, using
+     `agent.incoming_by_sku` (quantity and `next_eta`), or that nothing is on order.
+   - Open PO lines in `agent.po_lines` flagged `eta_passed_not_received`.
+   - Lines in `agent.po_eta_changes` with `days_slipped` over 7, by supplier.
+   - Lines in customs (`status = 'EN ADUANA'`) for more than 2 weeks, if visible
+     from the ETA history.
+   Treat ETAs with `eta_quality = 'month_only'` as estimates and say so.
 
 Put the top 5 actions first, then one short table per section.
 
 ## SKU review (when asked for "the SKU review")
-Skip any code with an ignored prefix or suffix (see Settings) in every step.
-
 1. **Missing mappings:** rows in `agent.unmapped_items` with
    `suggested_sku_same_code`, or with `suggested_sku_other_channel` and
-   `n_candidates = 1`. Split them in two groups: the suggested SKU is a
-   regular SKU, or it is a bundle (`is_bundle = true`).
-2. **Near matches:** unmapped items with no suggestion whose code is a
-   suffix variant of an existing SKU (e.g. `SCL-0068-A` for `SCL-0068`).
-   Flag codes that report exactly the same quantity as another code
-   (possible double count).
-3. **New products:** unmapped items with stock and no suggestion or near
-   match, grouped by `code_prefix`, largest stock first. Ask whether each
-   group is sellable before proposing new `sku_master` rows.
-4. **Retirement candidates:** non-bundle SKUs in `agent.sku_master_review`
+   `n_candidates = 1`. Propose INSERT statements into `public.sku_mappings`
+   (source, external_id, external_sku, internal_sku).
+2. **New products:** unmapped items with stock and no suggestion, excluding
+   non-sellable prefixes, grouped by `code_prefix`, largest stock first.
+   Ask whether each group is sellable before proposing new `sku_master` rows.
+3. **Retirement candidates:** non-bundle SKUs in `agent.sku_master_review`
    with status "never seen in any source", "seen but never had stock", or
-   "no stock in 60+ days". Recompute each status as if the mappings from
-   step 1 were already applied (use their history in
-   `agent.inventory_daily`), and drop SKUs that would become active.
-   Mark SKUs with a 3PL record created in the last 90 days as "Your call"
-   instead of "Deactivate". Never DELETE.
-5. **Output:** a review Google Sheet (format below), then a short summary
-   in chat with the link and any questions. Do NOT write SQL at this step.
+   "no stock in 60+ days". Propose `UPDATE ... SET is_active = false`.
+   Never DELETE.
+4. **SKUs on POs but not in sku_master:** lines in `agent.po_lines` with
+   `sku_not_in_sku_master`. These are usually new launches: propose
+   `sku_master` rows using the PO description, and ask for the category.
+5. **Output:** a table of proposed changes with evidence, then one SQL
+   block. State clearly that the user must review and run it. List
+   ambiguous cases as questions, never as SQL.
 
-## Review sheet format
-One Google Sheet per review, named "SKU review YYYY-MM-DD". Every row has
-a Row ID, a yellow Decision column with a dropdown, and a yellow Notes
-column. Header row frozen, filters on.
-
-| Tab | Row IDs | Key columns | Decision options |
-|---|---|---|---|
-| Summary | none | per tab: rows, approved, rejected, hold, not decided (formulas) | none |
-| Mappings | M-001 | Source, External ID, External SKU, Proposed internal SKU, Name in sku_master, Name at source, Units on hand, First seen | Approve / Reject / Hold |
-| Bundle mappings | B-001 | same as Mappings | Approve / Reject / Hold |
-| Near matches | N-001 | same as Mappings + Evidence | Approve / Reject / Hold |
-| Retirement | R-001 | Internal SKU, Name, Status today, Status once mappings are added, Last seen, Last with stock, Recent 3PL record, Proposed | Approve / Reject / Hold |
-| New products | P-01 | Code prefix, Items, Units on hand, Sources, First seen range, Largest codes, What it looks like | Sellable / Not sellable / Ignore prefix / Hold |
-| New product items | I-001 | Code prefix, Source, External ID, External SKU, Name at source, Units on hand, First seen | none |
-| Data Sources | none | query, run date, row count, changes made after retrieval | none |
-
-The Summary tab also lists notes and data gaps. Keep codes as text (no
-number conversion). If the Google Sheets connector is not available, say
-so and stop; do not fall back to SQL.
-
-## Turning approvals into SQL (when told the sheet is ready)
-1. Read the Decision column on every tab. Only "Approve" (or "Sellable",
-   for drafting new `sku_master` rows) becomes SQL. Blank, Hold and Reject
-   are skipped.
-2. Re-check each approved row against the `agent` views before writing
-   SQL. Drop and report rows that changed since the sheet was made.
-3. Flag conflicting decisions (e.g. a SKU approved for both a new mapping
-   and deactivation) as questions, and leave them out of the SQL.
-4. Write one SQL block in a single transaction: INSERT into
-   `public.sku_mappings` (source, external_id, external_sku, internal_sku)
-   skipping existing mappings, and `UPDATE ... SET is_active = false`
-   only where `is_active = true`. Put the Row ID as a comment on each line.
-5. State clearly that the user must review and run it, and the expected
-   row counts.
+## PO check (when asked for "the PO check")
+For the supply team to fix the sheet. From `agent.po_lines`, group lines by
+issue in `data_issues`, most urgent first (missing PO number, missing or
+unreadable ETA on open lines, dates in the future or out of sequence, ETA
+before pickup, missing SKU or quantity, information only in comments).
+For each, give the sheet tab, row number, PO and SKU as typed, and what to fix.
+Write it in Spanish, ready to send to the supply team.
 
 ## Always
 Never guess. If data is missing or unclear, say so under "Data gaps".
